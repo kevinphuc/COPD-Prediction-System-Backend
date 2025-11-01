@@ -20,6 +20,7 @@ fastapi-cloud-cli
 fonttools
 gotrue
 greenlet
+gunicorn
 h11
 h2
 hpack
@@ -55,7 +56,7 @@ propcache
 psycopg2-binary
 pycparser
 pydantic
-pydantic-core
+pydantic_core
 pydantic-settings
 Pygments
 PyJWT
