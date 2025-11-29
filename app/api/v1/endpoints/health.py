@@ -20,25 +20,24 @@ async def upload_health_data(
     current_user_id: UUID = Depends(get_current_user_id),
     
     # Form data
-    spirometry_data_str: str = Form(..., description='Dữ liệu spirometry (JSON string)'),
+    # spirometry_data_str: str = Form(..., description='Dữ liệu spirometry (JSON string)'),
     audio_file: UploadFile = File(..., description="File âm thanh (wav, mp3, ...)")
 ):
     """
     Endpoint chính: Nhận file âm thanh + dữ liệu spirometry.
     Sử dụng SQLModel Session và HealthService.
     """
-    try:
-        spirometry_json = json.loads(spirometry_data_str)
-        spirometry_data = SpirometrySchema.model_validate(spirometry_json)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Định dạng spirometry_data JSON không hợp lệ")
+    # try:
+    #     spirometry_json = json.loads(spirometry_data_str)
+    #     spirometry_data = SpirometrySchema.model_validate(spirometry_json)
+    # except Exception:
+    #     raise HTTPException(status_code=400, detail="Định dạng spirometry_data JSON không hợp lệ")
 
     audio_bytes = await audio_file.read()
     
     result = health_service.upload_new_health_data(
         session=session,
-        user_id=current_user_id,
-        spirometry_data=spirometry_data.model_dump(),
+        user_id=current_user_id,    
         audio_bytes=audio_bytes,
         audio_filename=audio_file.filename
     )

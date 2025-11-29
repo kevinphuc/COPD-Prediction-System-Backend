@@ -15,7 +15,7 @@ class HealthInput(SQLModel, table=True):
     __table_args__ = {'schema': 'public'}
 
     input_id: UUID = Field(default_factory=uuid4, primary_key=True)
-    user_id: UUID = Field(foreign_key="public.users.id", nullable=False)
+    user_id: UUID = Field(index=True, nullable=False)
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc), nullable=False
     )
