@@ -1,12 +1,13 @@
+import gc  # <--- [QUAN TRỌNG] Thư viện dọn rác bộ nhớ
 import io
-import traceback  # <--- Thêm cái này để debug lỗi
+import traceback
 
 import librosa
 
 # Matplotlib Backend configuration
 import matplotlib
 import numpy as np
-import tensorflow as tf
+import tensorflow as tf  # Vẫn import tf nhưng sẽ dùng bản Lite
 
 matplotlib.use("Agg")
 from typing import Any, Dict, List, Tuple
@@ -20,16 +21,27 @@ from sqlmodel import Session
 from app.crud import crud_health
 from app.db.supabase import supabase_service_client
 
-# --- LOAD MODEL ---
-MODEL = None
+# --- CẤU HÌNH LOAD MODEL TFLITE (SIÊU NHẸ) ---
+INTERPRETER = None
+INPUT_DETAILS = None
+OUTPUT_DETAILS = None
+
 try:
-    # Đảm bảo đường dẫn file .keras chính xác
-    MODEL = tf.keras.models.load_model("copd_spectrogram_model.keras")
-    print("HealthService: Đã tải Model thành công.")
+    # Lưu ý: Bạn cần push file .tflite lên Render
+    tflite_path = "copd_model.tflite"
+
+    # Chỉ load Interpreter thay vì toàn bộ Keras
+    INTERPRETER = tf.lite.Interpreter(model_path=tflite_path)
+    INTERPRETER.allocate_tensors()
+
+    INPUT_DETAILS = INTERPRETER.get_input_details()
+    OUTPUT_DETAILS = INTERPRETER.get_output_details()
+
+    print("HealthService: Đã tải TFLite Model thành công (RAM Optimized).")
+
 except Exception as e:
-    print(
-        f"HealthService Warning: Không tìm thấy model hoặc lỗi version. Chi tiết: {e}"
-    )
+    print(f"HealthService Warning: Lỗi tải TFLite Model. {e}")
+    print("Hãy chắc chắn bạn đã chạy script convert và upload file .tflite")
 
 
 class HealthService:
@@ -41,7 +53,6 @@ class HealthService:
     def _preprocess_audio_segment(
         self, audio_segment: np.ndarray, sr: int | float
     ) -> np.ndarray:
-        # ... (Giữ nguyên logic cũ của bạn) ...
         melspec = librosa.feature.melspectrogram(
             y=audio_segment, sr=sr, n_mels=128, fmax=8000
         )
@@ -59,10 +70,7 @@ class HealthService:
     def _generate_spectrogram_image(
         self, audio_file_bytes: bytes
     ) -> Tuple[bytes, Dict[str, Any], int]:
-        """
-        SỬA ĐỔI QUAN TRỌNG: Không dùng plt.subplots() (Global state)
-        Dùng Figure() object để an toàn trong môi trường Web Server (Thread-safe).
-        """
+        # Dùng Figure() object để an toàn Thread-safe
         try:
             with io.BytesIO(audio_file_bytes) as f:
                 y, sr = librosa.load(f, sr=16000)
@@ -70,41 +78,42 @@ class HealthService:
             S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128)
             S_db = librosa.power_to_db(S, ref=np.max)
 
-            # 1. Tạo Figure object trực tiếp
+            # Tạo Figure, set dpi thấp chút để tiết kiệm RAM vẽ ảnh
             fig = Figure(figsize=(5, 4), dpi=100)
             canvas = FigureCanvas(fig)
             ax = fig.add_subplot(111)
 
-            # 2. Vẽ lên ax
             img = librosa.display.specshow(
                 S_db, sr=sr, x_axis="time", y_axis="mel", ax=ax
             )
-            ax.axis("off")  # Tắt trục tọa độ
+            ax.axis("off")
 
-            # 3. Lưu vào buffer
             img_buffer = io.BytesIO()
-            canvas.print_png(img_buffer)  # Dùng canvas để in
-            # Hoặc: fig.savefig(img_buffer, format="png", bbox_inches="tight", pad_inches=0)
+            canvas.print_png(img_buffer)
 
-            img_buffer.seek(0)
-            png_bytes = img_buffer.read()
+            # Đóng figure ngay lập tức để giải phóng RAM Matplotlib
+            plt_data = img_buffer.getvalue()
+            img_buffer.close()
+            fig.clf()  # Clear figure
 
-            # Kích thước
-            dimensions = {"width": int(5 * 100), "height": int(4 * 100)}
-            file_size = len(png_bytes)
+            # Force delete variables
+            del S, S_db, y, img, canvas, ax, fig
 
-            return png_bytes, dimensions, file_size
+            dimensions = {"width": 500, "height": 400}
+            file_size = len(plt_data)
+
+            return plt_data, dimensions, file_size
 
         except Exception as e:
-            # In lỗi chi tiết ra terminal để debug
             traceback.print_exc()
             raise Exception(f"Lỗi tạo Spectrogram: {str(e)}")
 
     def _run_prediction_model(self, audio_bytes: bytes) -> float:
-        if MODEL is None:
-            print("Model is None. Returning random score.")
+        if INTERPRETER is None:
+            print("Model TFLite chưa load, trả về random.")
             return float(np.random.rand())
 
+        y = None
         try:
             with io.BytesIO(audio_bytes) as f:
                 y, sr = librosa.load(f, sr=16000)
@@ -117,26 +126,30 @@ class HealthService:
                 end = start + step
                 segment = y[start:end]
 
-                # Sửa logic: Nếu đoạn cuối < 1s thì bỏ qua, nhưng nếu < 5s mà > 1s thì vẫn nên pad để predict
                 if len(segment) < sr:
                     continue
 
-                # Quan trọng: Cần đảm bảo độ dài segment đủ để preprocessing không lỗi
-                # (Hàm preprocessing của bạn đã có padding, nên đoạn này ổn)
-
                 input_tensor = self._preprocess_audio_segment(segment, sr)
 
-                # Check shape trước khi predict để tránh crash
-                # print(f"Input shape: {input_tensor.shape}")
+                # --- LOGIC TFLITE THAY THẾ CHO KERAS ---
+                # Set input tensor (Cần ép kiểu về float32)
+                INTERPRETER.set_tensor(
+                    INPUT_DETAILS[0]["index"], input_tensor.astype(np.float32)
+                )
 
-                pred_prob = MODEL.predict(input_tensor, verbose=0)
+                # Chạy mô hình
+                INTERPRETER.invoke()
+
+                # Lấy kết quả
+                pred_prob = INTERPRETER.get_tensor(OUTPUT_DETAILS[0]["index"])
+                # ----------------------------------------
+
                 pred_class_idx = np.argmax(pred_prob)
                 pred_label = self.CLASSES[pred_class_idx]
                 predictions.append(pred_label)
 
-            print(f"Prediction results segments: {predictions}")
+            print(f"Prediction segments: {predictions}")
 
-            # Logic tính điểm rủi ro (Giữ nguyên)
             if not predictions:
                 return 0.0
 
@@ -156,9 +169,13 @@ class HealthService:
             return float(risk_score)
 
         except Exception as e:
-            print(f"Lỗi dự đoán Model: {e}")
-            traceback.print_exc()  # <--- Quan trọng để debug
+            print(f"Lỗi dự đoán TFLite: {e}")
+            traceback.print_exc()
             return 0.0
+        finally:
+            # Xóa biến y lớn
+            if y is not None:
+                del y
 
     def upload_new_health_data(
         self,
@@ -167,20 +184,21 @@ class HealthService:
         audio_bytes: bytes,
         audio_filename: str | None,
     ):
-        db_input = None  # Khởi tạo biến để tránh lỗi UnboundLocalError
+        db_input = None
+        png_bytes = None
+
         try:
             # 1. Tạo record input
             db_input = crud_health.create_health_input(session, user_id=user_id)
             input_id = db_input.input_id
 
-            # 2. Xử lý ảnh
+            # 2. Xử lý ảnh (Tách thành hàm riêng để biến cục bộ được giải phóng sau khi return)
             png_bytes, dims, size = self._generate_spectrogram_image(audio_bytes)
 
             # 3. Upload Storage
             storage_path = f"public/{user_id}/{input_id}.png"
 
-            # --- FIX CHO LỖI 544: Retry logic (Optional) ---
-            # Đôi khi mạng lag, thử upload lại 1 lần nếu thất bại
+            # Retry logic cho Storage
             try:
                 self.storage.from_("spectrogram").upload(
                     path=storage_path,
@@ -189,19 +207,21 @@ class HealthService:
                 )
             except Exception as upload_err:
                 print("Upload failed, retrying once...", upload_err)
-                # Thử lại lần 2
                 self.storage.from_("spectrogram").upload(
                     path=storage_path,
                     file=png_bytes,
                     file_options={"content-type": "image/png", "upsert": "true"},
                 )
-            # -----------------------------------------------
 
             public_url = self.storage.from_("spectrogram").get_public_url(storage_path)
 
-            # 4. Lưu DB
+            # 4. Lưu DB Spectrogram
             crud_health.create_spectrogram(session, input_id, public_url, dims, size)
+
+            # 5. Chạy Model (Dùng TFLite)
             risk_score = self._run_prediction_model(audio_bytes)
+
+            # 6. Lưu kết quả
             crud_health.create_prediction(session, input_id, risk_score)
 
             return {
@@ -214,15 +234,28 @@ class HealthService:
             print(f"CRITICAL ERROR: {e}")
             traceback.print_exc()
 
-            # Chỉ xóa nếu db_input đã được tạo
             if db_input:
                 try:
                     session.delete(db_input)
                     session.commit()
                 except:
-                    pass  # Bỏ qua lỗi khi rollback
+                    pass
 
             raise HTTPException(status_code=500, detail=f"Lỗi hệ thống: {str(e)}")
+
+        finally:
+            # --- [QUAN TRỌNG] DỌN RÁC BỘ NHỚ ---
+            # Xóa các biến chứa dữ liệu lớn
+            try:
+                del audio_bytes
+                if png_bytes:
+                    del png_bytes
+            except:
+                pass
+
+            # Ép Python chạy Garbage Collector ngay lập tức
+            # Giúp RAM giảm xuống ngay sau khi request kết thúc
+            gc.collect()
 
 
 health_service = HealthService()
