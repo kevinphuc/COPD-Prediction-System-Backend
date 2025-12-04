@@ -4,7 +4,7 @@ from typing import Annotated
 from app.db.supabase import supabase_anon_client
 from uuid import UUID
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/token")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
 
 def get_current_user_id(token: Annotated[str, Depends(oauth2_scheme)]) -> UUID:
     """
