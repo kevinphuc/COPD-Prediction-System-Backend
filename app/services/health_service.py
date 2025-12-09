@@ -8,7 +8,7 @@ import numpy as np
 import tensorflow as tf
 
 matplotlib.use("Agg")
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Tuple
 from uuid import UUID
 
 from fastapi import HTTPException
@@ -21,18 +21,9 @@ from sqlmodel import Session
 from app.crud import crud_health
 from app.db.supabase import supabase_service_client
 
-# --- LOAD MODEL TFLITE ---
-INTERPRETER = None
-INPUT_DETAILS = None
-OUTPUT_DETAILS = None
-
 try:
-    tflite_path = "copd_model.tflite"
-    INTERPRETER = tf.lite.Interpreter(model_path=tflite_path)
-    INTERPRETER.allocate_tensors()
-    INPUT_DETAILS = INTERPRETER.get_input_details()
-    OUTPUT_DETAILS = INTERPRETER.get_output_details()
-    print("HealthService: Đã tải TFLite Model.")
+    MODEL = tf.keras.models.load_model("copd_spectrogram_model.keras")
+    print("HealthService: Đã tải Model thành công.")
 except Exception as e:
     print(f"HealthService Warning: Lỗi tải TFLite Model. {e}")
 
@@ -62,9 +53,7 @@ class HealthService:
     ) -> Tuple[bytes, Dict[str, Any], int]:
         try:
             with io.BytesIO(audio_file_bytes) as f:
-                # [FIX 502] Chỉ load tối đa 15 giây để vẽ ảnh đại diện.
-                # Không cần vẽ cả bài dài gây tốn RAM.
-                y, sr = librosa.load(f, sr=16000, duration=15)
+                y, sr = librosa.load(f, sr=16000)
 
             S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128)
             S_db = librosa.power_to_db(S, ref=np.max)
@@ -80,27 +69,31 @@ class HealthService:
             canvas.print_png(img_buffer)
 
             plt_data = img_buffer.getvalue()
+            # png_bytes = img_buffer.read()
             img_buffer.close()
-            fig.clf()  # Xóa figure
+            # fig.clf()  # Xóa figure
 
             # Xóa biến ngay lập tức
-            del S, S_db, y, fig, canvas, ax
+            # del S, S_db, y, fig, canvas, ax
+            #
+            # # Kích thước
+            dimensions = {"width": 500, "height": 400}
+            file_size = len(plt_data)
 
-            return plt_data, {"width": 500, "height": 400}, len(plt_data)
+            return plt_data, dimensions, file_size
 
         except Exception as e:
             traceback.print_exc()
             raise Exception(f"Lỗi tạo Spectrogram: {str(e)}")
 
     def _run_prediction_model(self, audio_bytes: bytes) -> float:
-        if INTERPRETER is None:
+        if MODEL is None:
+            print("Model is None. Returning random score.")
             return 0.0
-        y = None
+        # y = None
         try:
             with io.BytesIO(audio_bytes) as f:
-                # [FIX 502] Chỉ load tối đa 30 giây để dự đoán.
-                # Xử lý >30s trên Render Free Tier rất dễ bị Timeout hoặc OOM.
-                y, sr = librosa.load(f, sr=16000, duration=30)
+                y, sr = librosa.load(f, sr=16000)
 
             cycle_duration = 5
             step = int(cycle_duration * sr)
@@ -114,11 +107,16 @@ class HealthService:
 
                 input_tensor = self._preprocess_audio_segment(segment, sr)
 
-                INTERPRETER.set_tensor(
-                    INPUT_DETAILS[0]["index"], input_tensor.astype(np.float32)
-                )
-                INTERPRETER.invoke()
-                pred_prob = INTERPRETER.get_tensor(OUTPUT_DETAILS[0]["index"])
+                # INTERPRETER.set_tensor(
+                #     INPUT_DETAILS[0]["index"], input_tensor.astype(np.float32)
+                # )
+                # INTERPRETER.invoke()
+                # pred_prob = INTERPRETER.get_tensor(OUTPUT_DETAILS[0]["index"])
+                #
+                pred_prob = MODEL.predict(input_tensor, verbose=0)
+                pred_class_idx = np.argmax(pred_prob)
+                pred_label = self.CLASSES[pred_class_idx]
+                predictions.append(pred_label)
 
                 predictions.append(self.CLASSES[np.argmax(pred_prob)])
 
@@ -136,10 +134,8 @@ class HealthService:
 
         except Exception as e:
             print(f"Lỗi dự đoán: {e}")
+            traceback.print_exc()
             return 0.0
-        finally:
-            if y is not None:
-                del y
 
     def upload_new_health_data(
         self,
@@ -167,17 +163,19 @@ class HealthService:
                     file=png_bytes,
                     file_options={"content-type": "image/png", "upsert": "true"},
                 )
-            except:
+            except Exception:
                 self.storage.from_("spectrogram").upload(
                     path=storage_path,
                     file=png_bytes,
                     file_options={"content-type": "image/png", "upsert": "true"},
                 )
+            # Kiểm tra xem res có trả về lỗi object không (Supabase py trả về dict hoặc raise)
 
             public_url = self.storage.from_("spectrogram").get_public_url(storage_path)
+            # Bước 3: Update DB Spectrogram
             crud_health.create_spectrogram(session, input_id, public_url, dims, size)
 
-            # Chạy model (Chỉ dùng 30s đầu)
+            # Chạy model
             risk_score = self._run_prediction_model(audio_bytes)
             crud_health.create_prediction(session, input_id, risk_score)
 
@@ -207,5 +205,6 @@ class HealthService:
             except:
                 pass
             gc.collect()  # Ép giải phóng RAM
+
 
 health_service = HealthService()

@@ -70,11 +70,3 @@ uvicorn app.main:app --reload
 ```
 
 Server sẽ chạy tại `http://127.0.0.1:8000`. Bạn có thể xem tài liệu API tại `http://127.0.0.1:8000/docs`.
-
-## LƯU Ý QUAN TRỌNG VỀ SCHEMA (NHẮC LẠI)
-
-Mã này được viết dựa trên giả định bạn đã làm theo các khuyến nghị sau:
-
-Bảng users: Đã XÓA cột password khỏi public.users và đã tạo Trigger handle_new_user (xem README cũ) để đồng bộ user từ auth.users sang public.users.
-
-Bảng spectrogram: Đã THAY ĐỔI cột spectrogram_data bytea thành spectrogram_url text. Chúng ta sẽ lưu ảnh PNG vào Supabase Storage và lưu URL vào cột này.
